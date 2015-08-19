@@ -20,16 +20,17 @@ const concurrentFetch = 100
 
 // Commandline flags.
 var (
-	addr           = flag.String("web.listen-address", ":9105", "Address to listen on for web interface and telemetry")
-	autoDiscover   = flag.Bool("exporter.discovery", false, "Discover all Mesos slaves")
-	localURL       = flag.String("exporter.local-url", "http://127.0.0.1:5051", "URL to the local Mesos slave")
-	masterURL      = flag.String("exporter.discovery.master-url", "http://mesos-master.example.com:5050", "Mesos master URL")
-	metricsPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
-	scrapeInterval = flag.Duration("exporter.interval", (60 * time.Second), "Scrape interval duration")
+	addr                 = flag.String("web.listen-address", ":9105", "Address to listen on for web interface and telemetry")
+	autoDiscover         = flag.Bool("exporter.discovery", false, "Discover all Mesos slaves")
+	localURL             = flag.String("exporter.local-url", "http://127.0.0.1:5051", "URL to the local Mesos slave")
+	masterURL            = flag.String("exporter.discovery.master-url", "http://mesos-master.example.com:5050", "Mesos master URL")
+	metricsPath          = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
+	scrapeInterval       = flag.Duration("exporter.interval", (60 * time.Second), "Scrape interval duration")
+	scrapeMasterInterval = flag.Duration("exporter.master-interval", (10 * time.Minute), "Scrape master interval duration")
 )
 
 var (
-	variableLabels = []string{"task", "slave", "framework_id"}
+	variableLabels = []string{"task", "slave", "framework_id", "framework_name"}
 
 	cpuLimitDesc = prometheus.NewDesc(
 		"mesos_task_cpu_limit",
@@ -56,6 +57,46 @@ var (
 		"Task memory RSS usage in bytes.",
 		variableLabels, nil,
 	)
+
+	frameworkVariableLabels = []string{"id", "name"}
+
+	frameworkResourcesUsedCpusDesc = prometheus.NewDesc(
+		"mesos_framework_resources_used_cpu",
+		"CPUs used by all tasks of a framework",
+		frameworkVariableLabels, nil,
+	)
+
+	frameworkResourcesUsedDiskDesc = prometheus.NewDesc(
+		"mesos_framework_resources_used_disk_megabytes",
+		"Disk space used by all tasks of a framework",
+		frameworkVariableLabels, nil,
+	)
+
+	frameworkResourcesUsedMemDesc = prometheus.NewDesc(
+		"mesos_framework_resources_used_memory_megabytes",
+		"Memory used by all tasks of a framework",
+		frameworkVariableLabels, nil,
+	)
+
+	slaveVariableLables = []string{"pid"}
+
+	slaveResourcesCpusDesc = prometheus.NewDesc(
+		"mesos_slave_resources_cpus",
+		"CPUs advertised by a Mesos slave",
+		slaveVariableLables, nil,
+	)
+
+	slaveResourcesDiskDesc = prometheus.NewDesc(
+		"mesos_slave_resources_disk_megabytes",
+		"Disk space advertised by a Mesos slave",
+		slaveVariableLables, nil,
+	)
+
+	slaveResourcesMemDesc = prometheus.NewDesc(
+		"mesos_slave_resources_memory_megabytes",
+		"Memory advertised by a Mesos slave",
+		slaveVariableLables, nil,
+	)
 )
 
 var httpClient = http.Client{
@@ -63,22 +104,53 @@ var httpClient = http.Client{
 }
 
 type exporterOpts struct {
-	autoDiscover bool
-	interval     time.Duration
-	localURL     string
-	masterURL    string
+	autoDiscover   bool
+	interval       time.Duration
+	localURL       string
+	masterInterval time.Duration
+	masterURL      string
+}
+
+type framework struct {
+	Active        bool
+	Id            string
+	Name          string
+	UsedResources *resources `json:"used_resources"`
 }
 
 type periodicExporter struct {
 	sync.RWMutex
-	errors    *prometheus.CounterVec
-	masterURL *url.URL
-	metrics   []prometheus.Metric
-	opts      *exporterOpts
-	slaves    struct {
+	errors     *prometheus.CounterVec
+	frameworks struct {
+		sync.RWMutex
+		mapping map[string]string
+	}
+	masterMetrics []prometheus.Metric
+	masterURL     *url.URL
+	metrics       []prometheus.Metric
+	opts          *exporterOpts
+	slaves        struct {
 		sync.Mutex
 		urls []string
 	}
+}
+
+type resources struct {
+	Cpus float64
+	Disk float64
+	Mem  float64
+}
+
+type slave struct {
+	Active    bool   `json:"active"`
+	Hostname  string `json:"hostname"`
+	Pid       string `json:"pid"`
+	Resources *resources
+}
+
+type state struct {
+	Frameworks []*framework
+	Slaves     []*slave
 }
 
 func newMesosExporter(opts *exporterOpts) *periodicExporter {
@@ -108,12 +180,12 @@ func newMesosExporter(opts *exporterOpts) *periodicExporter {
 
 		e.masterURL = parsedMasterURL
 
-		// Update nr. of mesos slaves every 10 minutes
-		e.updateSlaves()
-		go runEvery(e.updateSlaves, 10*time.Minute)
+		// Update nr. of Mesos Slaves and metrics of the Mesos Master.
+		e.scrapeMaster()
+		go runEvery(e.scrapeMaster, e.opts.masterInterval)
 	}
 
-	// Fetch slave metrics every interval
+	// Fetch slave metrics every interval.
 	go runEvery(e.scrapeSlaves, e.opts.interval)
 
 	return e
@@ -124,6 +196,10 @@ func (e *periodicExporter) Describe(ch chan<- *prometheus.Desc) {
 		for _, m := range e.metrics {
 			ch <- m.Desc()
 		}
+
+		for _, m := range e.masterMetrics {
+			ch <- m.Desc()
+		}
 	})
 	e.errors.MetricVec.Describe(ch)
 }
@@ -131,6 +207,10 @@ func (e *periodicExporter) Describe(ch chan<- *prometheus.Desc) {
 func (e *periodicExporter) Collect(ch chan<- prometheus.Metric) {
 	e.rLockMetrics(func() {
 		for _, m := range e.metrics {
+			ch <- m
+		}
+
+		for _, m := range e.masterMetrics {
 			ch <- m
 		}
 	})
@@ -169,36 +249,49 @@ func (e *periodicExporter) fetch(urlChan <-chan string, metricsChan chan<- prome
 			continue
 		}
 
+		frameworksMapping := make(map[string]string, len(e.frameworks.mapping))
+		e.frameworks.RLock()
+		for id, name := range e.frameworks.mapping {
+			frameworksMapping[id] = name
+		}
+		e.frameworks.RUnlock()
+
 		for _, stat := range stats {
+			fwName, ok := frameworksMapping[stat.FrameworkId]
+			// Do not record metrics of a task if its framework has not been discovered yet and the exporter is running in discovery mode.
+			if ok == false && e.opts.autoDiscover {
+				continue
+			}
+
 			metricsChan <- prometheus.MustNewConstMetric(
 				cpuLimitDesc,
 				prometheus.GaugeValue,
 				float64(stat.Statistics.CpusLimit),
-				stat.Source, host, stat.FrameworkId,
+				stat.Source, host, stat.FrameworkId, fwName,
 			)
 			metricsChan <- prometheus.MustNewConstMetric(
 				cpuSysDesc,
 				prometheus.CounterValue,
 				float64(stat.Statistics.CpusSystemTimeSecs),
-				stat.Source, host, stat.FrameworkId,
+				stat.Source, host, stat.FrameworkId, fwName,
 			)
 			metricsChan <- prometheus.MustNewConstMetric(
 				cpuUsrDesc,
 				prometheus.CounterValue,
 				float64(stat.Statistics.CpusUserTimeSecs),
-				stat.Source, host, stat.FrameworkId,
+				stat.Source, host, stat.FrameworkId, fwName,
 			)
 			metricsChan <- prometheus.MustNewConstMetric(
 				memLimitDesc,
 				prometheus.GaugeValue,
 				float64(stat.Statistics.MemLimitBytes),
-				stat.Source, host, stat.FrameworkId,
+				stat.Source, host, stat.FrameworkId, fwName,
 			)
 			metricsChan <- prometheus.MustNewConstMetric(
 				memRssDesc,
 				prometheus.GaugeValue,
 				float64(stat.Statistics.MemRssBytes),
-				stat.Source, host, stat.FrameworkId,
+				stat.Source, host, stat.FrameworkId, fwName,
 			)
 		}
 	}
@@ -256,8 +349,9 @@ func (e *periodicExporter) scrapeSlaves() {
 	close(metricsChan)
 }
 
-func (e *periodicExporter) updateSlaves() {
-	log.Debug("discovering slaves...")
+func (e *periodicExporter) scrapeMaster() {
+	masterMetrics := make([]prometheus.Metric, 0)
+	log.Debug("scraping master...")
 
 	// This will redirect us to the elected mesos master
 	redirectURL := fmt.Sprintf("%s://%s/master/redirect", e.masterURL.Scheme, e.masterURL.Host)
@@ -302,25 +396,50 @@ func (e *periodicExporter) updateSlaves() {
 	}
 	defer resp.Body.Close()
 
-	type slave struct {
-		Active   bool   `json:"active"`
-		Hostname string `json:"hostname"`
-		Pid      string `json:"pid"`
-	}
-
-	var req struct {
-		Slaves []*slave `json:"slaves"`
-	}
+	var req state
 
 	if err := json.NewDecoder(resp.Body).Decode(&req); err != nil {
 		log.Warnf("failed to deserialize request: %s", err)
 		return
 	}
 
+	fwMapping := make(map[string]string, 0)
+	for _, framework := range req.Frameworks {
+		if framework.Active {
+			fwMapping[framework.Id] = framework.Name
+
+			frameworkMetrics := []prometheus.Metric{
+				prometheus.MustNewConstMetric(
+					frameworkResourcesUsedCpusDesc,
+					prometheus.GaugeValue,
+					framework.UsedResources.Cpus,
+					framework.Id, framework.Name,
+				),
+				prometheus.MustNewConstMetric(
+					frameworkResourcesUsedDiskDesc,
+					prometheus.GaugeValue,
+					framework.UsedResources.Disk,
+					framework.Id, framework.Name,
+				),
+				prometheus.MustNewConstMetric(
+					frameworkResourcesUsedMemDesc,
+					prometheus.GaugeValue,
+					framework.UsedResources.Mem,
+					framework.Id, framework.Name,
+				),
+			}
+
+			masterMetrics = append(masterMetrics, frameworkMetrics...)
+		}
+	}
+	e.frameworks.Lock()
+	e.frameworks.mapping = fwMapping
+	e.frameworks.Unlock()
+
 	var slaveURLs []string
 	for _, slave := range req.Slaves {
 		if slave.Active {
-			// Extract slave port from pid
+			// Extract slave port from pid.
 			_, port, err := net.SplitHostPort(slave.Pid)
 			if err != nil {
 				port = "5051"
@@ -328,10 +447,37 @@ func (e *periodicExporter) updateSlaves() {
 			url := fmt.Sprintf("http://%s:%s", slave.Hostname, port)
 
 			slaveURLs = append(slaveURLs, url)
+
+			slaveMetrics := []prometheus.Metric{
+				prometheus.MustNewConstMetric(
+					slaveResourcesCpusDesc,
+					prometheus.GaugeValue,
+					slave.Resources.Cpus,
+					slave.Pid,
+				),
+				prometheus.MustNewConstMetric(
+					slaveResourcesDiskDesc,
+					prometheus.GaugeValue,
+					slave.Resources.Disk,
+					slave.Pid,
+				),
+				prometheus.MustNewConstMetric(
+					slaveResourcesMemDesc,
+					prometheus.GaugeValue,
+					slave.Resources.Mem,
+					slave.Pid,
+				),
+			}
+
+			masterMetrics = append(masterMetrics, slaveMetrics...)
 		}
 	}
 
 	log.Debugf("%d slaves discovered", len(slaveURLs))
+
+	e.Lock()
+	e.masterMetrics = masterMetrics
+	e.Unlock()
 
 	e.slaves.Lock()
 	e.slaves.urls = slaveURLs
@@ -348,10 +494,11 @@ func main() {
 	flag.Parse()
 
 	opts := &exporterOpts{
-		autoDiscover: *autoDiscover,
-		interval:     *scrapeInterval,
-		localURL:     strings.TrimRight(*localURL, "/"),
-		masterURL:    strings.TrimRight(*masterURL, "/"),
+		autoDiscover:   *autoDiscover,
+		interval:       *scrapeInterval,
+		localURL:       strings.TrimRight(*localURL, "/"),
+		masterInterval: *scrapeMasterInterval,
+		masterURL:      strings.TrimRight(*masterURL, "/"),
 	}
 	exporter := newMesosExporter(opts)
 	prometheus.MustRegister(exporter)
